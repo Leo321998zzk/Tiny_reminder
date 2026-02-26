@@ -39,123 +39,6 @@ struct Homework: Identifiable {
     var customSchedule: NotificationSchedule? // nil = use global default
 }
 
-// Global settings screen for configuring the default reminder schedule
-// used by all homework items that don't have a custom schedule.
-struct SettingsView: View {
-    @Binding var schedule: NotificationSchedule
-
-    var body: some View {
-        Form {
-            // Far phase controls: how often to remind when the deadline is still far away
-            Section(header: Text("📅 Far From Deadline")) {
-                // Stepper to adjust reminder interval (hours) when far from deadline (1-24)
-                Stepper("Remind every \(schedule.daysBeforeInterval) hour(s)",
-                        value: $schedule.daysBeforeInterval, in: 1...24)
-                Text("When the deadline is more than \(schedule.switchToHourlyAt) hour(s) away.")
-                    .font(.caption).foregroundColor(.gray)
-            }
-
-            // Close phase controls: switch threshold and minute-level cadence near the deadline
-            Section(header: Text("⏰ Close to Deadline")) {
-                // Stepper to adjust threshold hour count for switching reminder frequency (1-48)
-                Stepper("Switch when \(schedule.switchToHourlyAt) hour(s) remain",
-                        value: $schedule.switchToHourlyAt, in: 1...48)
-                // Stepper to adjust reminder interval (minutes) when close to deadline (5-60 step 5)
-                Stepper("Remind every \(schedule.hoursBeforeInterval) min(s)",
-                        value: $schedule.hoursBeforeInterval, in: 5...60, step: 5)
-                Text("When the deadline is within \(schedule.switchToHourlyAt) hour(s).")
-                    .font(.caption).foregroundColor(.gray)
-            }
-
-            // Human-readable summary of the current configuration
-            Section(header: Text("📋 Summary")) {
-                Text("Far: every \(schedule.daysBeforeInterval)h → switches to every \(schedule.hoursBeforeInterval)min when \(schedule.switchToHourlyAt)h remain → stops at deadline or deletion.")
-                    .font(.caption)
-                    .foregroundColor(.gray)
-            }
-        }
-        // Title shown in the navigation bar
-        .navigationTitle("Notification Settings")
-    }
-}
-
-// Per-item override settings. Lets the user switch between using the
-// global schedule and a custom schedule for a specific homework item.
-struct ItemSettingsView: View {
-    // The homework item being edited (two-way binding)
-    @Binding var homework: Homework
-    // Read-only copy of the current global schedule to show defaults
-    var globalSchedule: NotificationSchedule
-
-    // Whether this item uses a custom schedule override
-    @State private var useCustom: Bool = false
-    // Local working copy of the schedule when useCustom is true
-    @State private var localSchedule: NotificationSchedule
-
-    init(homework: Binding<Homework>, globalSchedule: NotificationSchedule) {
-        self._homework = homework
-        self.globalSchedule = globalSchedule
-        // Initialize state based on whether the homework already has a custom schedule.
-        // If present, start with that and mark useCustom = true; otherwise mirror the global schedule.
-        if let custom = homework.wrappedValue.customSchedule {
-            _useCustom = State(initialValue: true)
-            _localSchedule = State(initialValue: custom)
-        } else {
-            _useCustom = State(initialValue: false)
-            _localSchedule = State(initialValue: globalSchedule)
-        }
-    }
-
-    var body: some View {
-        Form {
-            // Toggle between using the global default and a per-item custom schedule
-            Section {
-                Toggle("Use custom schedule for this item", isOn: $useCustom)
-                    .onChange(of: useCustom) { value in
-                        // Persist the choice back to the bound homework model
-                        homework.customSchedule = value ? localSchedule : nil
-                    }
-            }
-
-            if useCustom {
-                // Far phase cadence (hours) for this item
-                Section(header: Text("📅 Far From Deadline")) {
-                    // Stepper to adjust far phase interval hours
-                    Stepper("Remind every \(localSchedule.daysBeforeInterval) hour(s)",
-                            value: $localSchedule.daysBeforeInterval, in: 1...24)
-                        .onChange(of: localSchedule.daysBeforeInterval) { _ in
-                            homework.customSchedule = localSchedule
-                        }
-                }
-
-                // Close phase: switch threshold (hours) and cadence (minutes)
-                Section(header: Text("⏰ Close to Deadline")) {
-                    // Stepper to adjust switch threshold (hours)
-                    Stepper("Switch when \(localSchedule.switchToHourlyAt) hour(s) remain",
-                            value: $localSchedule.switchToHourlyAt, in: 1...48)
-                        .onChange(of: localSchedule.switchToHourlyAt) { _ in
-                            homework.customSchedule = localSchedule
-                        }
-                    // Stepper to adjust close phase interval minutes
-                    Stepper("Remind every \(localSchedule.hoursBeforeInterval) min(s)",
-                            value: $localSchedule.hoursBeforeInterval, in: 5...60, step: 5)
-                        .onChange(of: localSchedule.hoursBeforeInterval) { _ in
-                            homework.customSchedule = localSchedule
-                        }
-                }
-            } else {
-                // Read-only view of the global default when custom is off
-                Section(header: Text("Using Global Default")) {
-                    Text("Far: every \(globalSchedule.daysBeforeInterval)h")
-                    Text("Close: every \(globalSchedule.hoursBeforeInterval)min when \(globalSchedule.switchToHourlyAt)h remain")
-                }
-                .foregroundColor(.gray)
-            }
-        }
-        .navigationTitle(homework.subject)
-    }
-}
-
 // Main screen: allows creating homework reminders, lists upcoming items,
 // and provides access to global and per-item settings. Also handles scheduling
 // and cancellation of local notifications.
@@ -168,6 +51,10 @@ struct ContentView: View {
     @State private var dueDate = Date()
     // Continuously updated current time used to filter and clamp dates
     @State private var currentTime = Date()
+    // Stable lower bound for the DatePicker to prevent snapping while scrolling
+    @State private var datePickerLowerBound = Date()
+    // Controls whether the past-due banner is hidden by user
+    @State private var hidePastDueBanner = false
     // Global default notification schedule (used when items have no override)
     @State private var globalSchedule = NotificationSchedule(
         daysBeforeInterval: 6,   // Notify every 6 hours when far
@@ -182,10 +69,44 @@ struct ContentView: View {
     var upcomingHomework: [Homework] {
         homeworkList.filter { $0.dueDate > currentTime }
     }
+    // Derived collection of past-due homework items
+    var pastDueHomework: [Homework] {
+        homeworkList.filter { $0.dueDate <= currentTime }
+    }
 
     var body: some View {
         NavigationView {
             VStack {
+                // Past-due banner
+                if !hidePastDueBanner && !pastDueHomework.isEmpty {
+                    HStack(alignment: .center) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundColor(.white)
+                        VStack(alignment: .leading, spacing: 2) {
+                            let count = pastDueHomework.count
+                            Text("\(count) assignment\(count == 1 ? "" : "s") past due")
+                                .font(.subheadline)
+                                .foregroundColor(.white)
+                            // Show names of up to 2 items
+                            let names = pastDueHomework.prefix(2).map { $0.subject }
+                            if !names.isEmpty {
+                                Text(names.joined(separator: ", "))
+                                    .font(.caption)
+                                    .foregroundColor(.white.opacity(0.9))
+                            }
+                        }
+                        Spacer()
+                        Button(action: { hidePastDueBanner = true }) {
+                            Image(systemName: "xmark.circle.fill").foregroundColor(.white.opacity(0.9))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(10)
+                    .background(Color.red)
+                    .cornerRadius(10)
+                    .padding([.horizontal, .top])
+                }
+
                 // Subject input for the new homework item
                 TextField("Subject name", text: $subject)
                     .textFieldStyle(RoundedBorderTextFieldStyle())
@@ -193,7 +114,7 @@ struct ContentView: View {
 
                 // Due date/time picker constrained to not allow past dates
                 DatePicker("Due Date", selection: $dueDate,
-                           in: currentTime...,
+                           in: datePickerLowerBound...,
                            displayedComponents: [.date, .hourAndMinute])
                     .padding()
 
@@ -246,12 +167,17 @@ struct ContentView: View {
                 }
             }
             // Ask for notification permission when the view appears
-            .onAppear { requestPermission() }
+            .onAppear {
+                requestPermission()
+                // Capture a stable lower bound for the DatePicker when the view appears
+                datePickerLowerBound = Date()
+            }
             // Keep currentTime fresh and clamp dueDate so it never goes into the past
             .onReceive(timer) { _ in
                 currentTime = Date()
-                if dueDate <= currentTime {
-                    dueDate = currentTime
+                // If nothing is past due anymore, allow the banner to show in the future
+                if pastDueHomework.isEmpty {
+                    hidePastDueBanner = false
                 }
             }
         }
@@ -269,6 +195,12 @@ struct ContentView: View {
     func addHomework() {
         // Require a non-empty subject
         guard !subject.isEmpty else { return }
+        // Ensure dueDate is at least a few seconds in the future to avoid past scheduling
+        let now = Date()
+        let minimumLead: TimeInterval = 5 // seconds
+        if dueDate < now.addingTimeInterval(minimumLead) {
+            dueDate = now.addingTimeInterval(minimumLead)
+        }
         // Construct the new model instance
         let hw = Homework(subject: subject, dueDate: dueDate)
         // Add to our in-memory list
